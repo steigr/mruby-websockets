@@ -70,11 +70,23 @@ module WebSocket
       raise e
     end
 
+    def socket
+      http_handshake unless @http_handshake_successful
+      @socket
+    end
+
+    def msgs
+      @msgs ||= []
+    end
+
     private
+
     def http_handshake
       key = WebSocket.create_key
-      @socket.write("GET #{@path} HTTP/1.1\r\nHost: #{@host}:#{@port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: #{key}\r\n\r\n")
-      buf = @socket.recv 16384
+      @socket.write("GET #{@path} HTTP/1.1\r\nHost: #{@host}:#{@port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: #{key}\r\nSec-WebSocket-Protocol: binary\r\n\r\n")
+      buf  = @socket.readline
+      buf << @socket.readline until buf[-4..-1] == "\r\n\r\n"
+      puts buf.inspect
       phr = Phr.new
       loop do
         ret = phr.parse_response(buf)
@@ -82,15 +94,17 @@ module WebSocket
         when Fixnum
           break
         when :incomplete
-          buf << @socket.recv(16384)
+          buf << @socket.readline
         when :parser_error
           raise Error, "HTTP Parser error"
         end
       end
       headers = phr.headers.to_h
-      unless Sodium.memcmp(WebSocket.create_accept(key), headers.fetch('sec-websocket-accept'))
+      unless WebSocket.create_accept(key).securecmp(headers.fetch('sec-websocket-accept'))
+        @http_handshake_successful = false
         raise Error, "Handshake failure"
       end
+      @http_handshake_successful ||= true
     end
 
     def make_nonblock
@@ -99,7 +113,7 @@ module WebSocket
 
     def setup_ws
       @callbacks = Wslay::Event::Callbacks.new
-      @callbacks.recv_callback {|buf, len| @socket.recv len}
+      @callbacks.recv_callback {|buf, len| @socket.read len}
       @callbacks.send_callback {|buf| @socket.write buf}
       @msgs = []
       @callbacks.on_msg_recv_callback {|msg| @msgs << msg}
@@ -118,8 +132,7 @@ module WebSocket
       @port = port
       @path = path
       @tcp_socket = TCPSocket.new host, port
-      @socket = Tls::Client.new(*args)
-      @socket.connect_socket @tcp_socket.fileno, host
+      @socket = TLS.new(@tcp_socket,*args)
     end
 
     private
@@ -132,8 +145,8 @@ module WebSocket
       @callbacks.recv_callback do |buf, len|
         ret = -1
         begin
-          ret = @socket.recv len
-        rescue Tls::WantPollin, Tls::WantPollout
+          ret = @socket.read len
+        rescue RuntimeError
           raise Errno::EWOULDBLOCK
         end
         ret
@@ -142,7 +155,7 @@ module WebSocket
         ret = -1
         begin
           ret = @socket.write buf
-        rescue Tls::WantPollin, Tls::WantPollout
+        rescue RuntimeError
           raise Errno::EWOULDBLOCK
         end
         ret
@@ -183,6 +196,14 @@ module WebSocket
 
     def close(status_code = :normal_closure, reason = nil, timeout = -1)
       @connection.close(status_code, reason, timeout)
+    end
+
+    def socket
+      @connection.socket
+    end
+
+    def msgs
+      @connection.msgs
     end
   end
 end
